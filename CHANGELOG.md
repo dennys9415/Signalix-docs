@@ -1,5 +1,49 @@
 # Signalix Changelog
 
+## v0.7.1 — 2026-06-07
+
+### Added
+
+#### In-chat search (`Signalix-contracts`, `Signalix-api`, `Signalix-frontend`)
+
+- **`GET /api/v1/chats/:chatId/search?q=&limit=&cursor=`** — substring lookup scoped to a single chat the caller participates in. Same ILIKE machinery as the global endpoint but with one chat in scope. Matches `message_type IN ('text', 'file')` — FILE bodies are JSON-stringified blobs that include the filename, so substring-matching the raw `ciphertext` catches filename hits without needing a JSON cast. Default `limit` 100 (max 200) so the UI can render "X of Y" navigation across the entire match set. Cursor on `created_at DESC` for paging through huge match sets when needed.
+- **New contracts** — `SearchInChatRequest`, `InChatSearchMatchDTO`, `SearchInChatResponse`.
+- **`SearchInChatDto` (API)** — `class-validator`: `q` 2–200 chars, `limit` 1–200.
+- **`Signalix-frontend/src/lib/api-client.ts → searchInChat(chatId, q, opts)`** — typed wrapper.
+- **MessageView header morphs into a search bar** when the magnifier icon is tapped: ✕ close + pill input with magnifier glyph + match counter (`3 of 12`, `No matches`, `…` while loading) + ↑/↓ navigation. Same shell on desktop and mobile so the existing header-action layout doesn't reflow.
+- **Keyboard** — `Enter` next, `Shift+Enter` previous, `Esc` close. The input is auto-focused when search opens.
+- **Match navigation + highlighting** — `MessageBubble` gains three optional props: `searchTerm`, `isMatch`, `isActiveMatch`. Matched bubbles get a soft amber ring (`signalix-search-match`); the focused match gets a stronger blue ring with glow (`signalix-search-active`) plus an `useEffect`-driven `scrollIntoView({ block: 'center' })`. TEXT bubbles render every occurrence of the query inline via `<mark>` (`highlightMatches` helper) — case-insensitive, all occurrences. FILE bubbles get the ring only (filename is already substring-matched server-side).
+- **Stale-response protection** — a `searchSeqRef` increments on every new query; responses for older sequence numbers are dropped. Same protection added to the sidebar global search.
+- **CSS utilities** — `.signalix-search-match` and `.signalix-search-active` added to `globals.css` with light/dark variants. The existing `.signalix-search-hit` (transient ring from sidebar click-through) is untouched.
+
+#### Sidebar global search — pagination scroll (`Signalix-frontend`)
+
+- `ChatSidebar.handleResultsScroll` watches the results container; firing `loadMoreMessageResults()` when within 120 px of the bottom. `messageNextCursor` + `messageHasMore` + `loadingMore` state added; existing `searchMessages` helper already accepted `{ cursor }`. A "Load more" fallback button appears below the list when there's more to fetch.
+- `activeQueryRef` tracks the current query so cursor-paged responses from older queries are discarded; the container also scrolls back to top on every new query.
+
+#### Message search (`Signalix-contracts`, `Signalix-api`, `Signalix-frontend`)
+
+- **`GET /api/v1/messages/search?q=&limit=&cursor=`** — case-insensitive substring lookup over the caller's accessible TEXT messages. `q` is required (2–200 chars); `limit` defaults to 20 (max 50); `cursor` is the base64-ISO of the previous page's last row. Sort is `created_at DESC`.
+- **SQL implementation** — single `messages` query with:
+  - `m.ciphertext ILIKE $pattern ESCAPE '\\'` (input escaped to neutralise `%`, `_`, `\\` from the user).
+  - `EXISTS chat_participants` for access control.
+  - `NOT EXISTS message_deletions` (per-user deletion) and `NOT EXISTS chat_deletions` cutoff (`m.created_at <= cd.deleted_at`).
+  - `LEFT JOIN LATERAL` for direct-chat label/avatar resolution — picks the other participant's display name + avatar in the same query rather than a follow-up round-trip.
+  - `LEFT(m.ciphertext, 280)` keeps the response payload small.
+  - Keyset cursor `m.created_at < $cursorTs::timestamptz`.
+- **New contracts** — `SearchMessagesRequest`, `MessageSearchResultDTO`, `SearchMessagesResponse`. `MessageSearchResultDTO` is self-contained (chat label / avatar, sender info, snippet) so clients can render rows without an extra lookup against their cached chat list.
+- **`SearchMessagesDto` (API)** — `class-validator` rules: `q` 2–200 chars, `limit` 1–50.
+- **`Signalix-frontend/src/lib/api-client.ts → searchMessages(q, { limit?, cursor? })`** — typed wrapper.
+- **Sidebar UX** — the existing search input now fires both `searchUsers` and `searchMessages` in parallel inside a single `useTransition`. Results panel renders two sections: **People** (existing user-search behaviour) and **Messages** (new). Snippet rendering inlines a `<mark>` with translucent blue background for the matched substring; if the match position is > 60 chars into the body, the snippet windows around it instead of always slicing from the start.
+- **Click-through to message** — message-result click navigates to `/chats/<chatId>?m=<messageId>`. `MessageView` reads `m` via `useSearchParams`, finds the row via `data-message-id`, and `scrollIntoView({ block: 'center' })` + applies a transient `signalix-search-hit` ring (new utility in `globals.css`) that fades after ~2 s. The auto-scroll-to-bottom effect is skipped on the first render when targeting a specific message so we don't fight the highlight scroll.
+
+### Known limitations (v0.7.1)
+
+- Scroll-to-message only works when the target is in the loaded page (default 50 newest messages). Older messages: open the chat, scroll up manually.
+- Sidebar messages section shows only the first 12 hits — pagination via `nextCursor` is exposed by the API but not yet wired into the UI.
+- ILIKE without a trigram or FTS index — fine for current dataset sizes; future iteration can add `pg_trgm` or `tsvector` for sublinear search.
+- TEXT messages only — image / file / voice payloads are URLs/JSON, not user content.
+
 ## v0.7.0 — 2026-06-07
 
 ### Added

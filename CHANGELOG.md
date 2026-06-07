@@ -1,5 +1,87 @@
 # Signalix Changelog
 
+## v0.9.1 — 2026-06-07
+
+### Theme
+
+**E2EE hardening.** v0.9.1 closes the worst footguns from the v0.9.0 beta. Direct text messages still flow the same way on the wire; the difference is that the server now refuses to publish a malformed bundle, the client refuses to encrypt to one, one-time pre-keys are actually consumed, a corrupt local crypto store auto-recovers, and a re-render that fails to decrypt no longer flickers between empty body and `"[Unable to decrypt message]"`.
+
+> Scope is still direct text only. Groups, media, voice, push previews, multi-device fan-out, Double Ratchet, and the safety-number verification UI remain v0.10.0+ work.
+
+### Added
+
+#### Server-side signature verification (`Signalix-api`)
+
+- **`crypto.service.registerDeviceKeys` and `rotateSignedPreKey`** now verify the Ed25519 signature on `signedPreKey.publicKey` against the device's `signingKey` *before* writing the row, using `node:crypto.webcrypto.subtle.verify('Ed25519', …)`. Failure → 400 `VALIDATION_ERROR` with a generic public message; the dev log records the keyId for diagnosis.
+- **Wire-format byte-length checks.** `identityKey`, `signingKey`, `signedPreKey.publicKey`, every `preKey.publicKey` must be 32 bytes; `signedPreKey.signature` must be 64 bytes. Anything else is rejected up front rather than persisted as a corrupt row.
+- **Rotate flow looks up the device's existing signing key** so a rotated SPK signature can't be re-signed by an attacker who only has the new SPK private key.
+
+#### Client-side bundle validation (`Signalix-frontend`)
+
+- **`signal.service.assertBundleIsValid`** runs before any ECDH derivation:
+  - structural shape (`identityKey`, `signingKey`, `signedPreKey.{keyId, publicKey, signature}` present; `preKey` optional but well-typed),
+  - base64url decodability,
+  - exact byte lengths (32 / 32 / 32 / 64; 32 if `preKey` present),
+  - Ed25519 signature check on `signedPreKey.publicKey` via `signingKey`.
+- On failure `encryptForRecipient` throws — there is no plaintext fallback for a tampered bundle.
+
+#### One-time pre-key consumption + auto top-up (`Signalix-frontend`)
+
+- `decryptIncoming` flips `PreKeyRecord.consumed = true` after a successful decrypt that used `preKeyId`, then asynchronously checks the unconsumed count. If it dips below 20, the service generates fresh X25519 pairs back up to a target of ~100 and publishes them via `POST /crypto/devices/pre-keys`. Init-time top-up uses the same target.
+- Pre-keys are kept locally even after consumption (so late envelopes that reference them can still decrypt during the transition window); the `consumed` flag is what drives the top-up math.
+
+#### Device reset detection + banner (`Signalix-frontend`)
+
+- `signal.service.init` detects three reset triggers: no local identity, identity bound to a different `deviceId`, or partial state (identity present but no signed pre-keys / no pre-keys). On any of these it wipes the four crypto-only IDB stores plus the plaintext cache plus the fingerprint cache, regenerates a fresh identity + signed pre-key + 100 pre-keys, republishes them, and sets `wasReset = true`.
+- New `EncryptionResetBanner` component (mounted in `app/chats/layout.tsx`) reads `getCryptoStatus().wasReset` once init settles and shows a dismissible amber notice: **"Encryption keys were reset on this device."** Clicking *Got it* calls `acknowledgeCryptoReset()` so the banner doesn't reappear on re-render.
+
+#### Decrypt failure cache (`Signalix-frontend`)
+
+- `PlaintextCacheRecord` gains an optional `failed: boolean` (plus dev-only `failedReason`). `cacheDecryptFailure(messageId, chatId, reason?)` records the negative result; `isDecryptFailureCached(messageId)` short-circuits future attempts.
+- `chat.store.decryptStoredMessage` checks the failure cache before attempting decrypt and writes to it on the catch path. History reloads no longer re-run a broken handshake on every render, and the UI no longer flickers between empty body and `"[Unable to decrypt message]"`.
+
+#### Safety number foundation (`Signalix-frontend`, no UI yet)
+
+- New `src/lib/crypto/fingerprints.ts` — computes the per-peer safety number as 12 groups of 5 decimal digits (5200 rounds of SHA-256 over the lexicographically-ordered identity-key pair, extended to 60 bytes via one more SHA-256 round, then chunked into 5-byte groups mod 10⁵).
+- New `STORE_FINGERPRINTS` IndexedDB store (`peerUserId` keyed). `SignalCryptoService.getSafetyNumber(peerUserId)` returns the cached value or computes + caches one from a freshly validated bundle.
+- v0.9.1 ships the foundation only — the verification UI lands in v0.10.0.
+
+#### IndexedDB schema bump (`Signalix-frontend`)
+
+- `CRYPTO_DB_VERSION` 1 → 2 — adds the `fingerprints` store. Existing `identity` / `signed-pre-keys` / `pre-keys` / `plaintext-cache` rows survive the upgrade unchanged.
+- New helpers `idbDelete` and `idbClearStore` used by the reset path.
+
+#### Tests (`Signalix-frontend`)
+
+- Added `vitest` as a dev dependency and `test` / `test:watch` scripts.
+- `src/lib/crypto/utils.test.ts` — base64url round-trip, `concatBytes`, `bytesToHex`, `verifyEd25519Signature` (positive, tampered-message, malformed-key).
+- `src/lib/crypto/fingerprints.test.ts` — output format (12 × 5 digits), symmetry across argument order, sensitivity to a single bit flip.
+
+### Fixed
+
+- **Sender no longer encrypts to a forged or corrupted bundle.** Before v0.9.1 any 32-byte string at `signedPreKey.publicKey` would have been accepted; now the Ed25519 signature must verify or the send aborts.
+- **Top-up math** now counts only unconsumed pre-keys instead of the raw row total. The previous code could leave the local pool effectively empty while the row count looked healthy.
+- **Repeated decrypt attempts on history reload.** Each failed message used to re-run the handshake on every render of the message list; v0.9.1 caches the failure and short-circuits.
+
+### Not changed
+
+- WS protocol, contracts, REST routes — all identical to v0.9.0. Existing v0.9.0 clients keep talking to a v0.9.1 server (their bundles will be re-validated on next register / rotate; if they were ever publishing junk, the server now says so).
+- Realtime service untouched.
+- Database schema (`V14__crypto_foundation.sql`) untouched. The `consumed_at` server column was already there since v0.8.0; v0.9.1 just mirrors that state locally too.
+
+### Known limitations (carried from v0.9.0)
+
+- Single-device only; the sender picks the first bundle returned.
+- No Double Ratchet — forward secrecy still bounded by signed-pre-key rotation.
+- No encrypted push previews.
+- No safety-number / key-verification UI (foundation only).
+- Groups, images, files, voice notes remain plaintext on the server.
+
+### Roadmap signal
+
+- **v0.10.0** — Double Ratchet, multi-device fan-out, encrypted push previews, safety-number verification UI surfacing the v0.9.1 fingerprint store, automatic signed-pre-key rotation.
+- **v0.11.0+** — group encryption (Sender Keys), media / file / voice encryption.
+
 ## v0.9.0 — 2026-06-07
 
 ### Fixed (post-initial-cut)

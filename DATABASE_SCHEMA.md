@@ -197,8 +197,64 @@ These were applied as additive migrations between v0.2 and v0.6. See `Signalix-a
 | `V11__read_state.sql` | `chat_read_state(chat_id, user_id, last_read_message_id, ...)` | Persistent unread counters per (chat × user) |
 | `V12__push_subscriptions.sql` | `push_subscriptions(id, user_id, endpoint, p256dh, auth, created_at, updated_at)` with `UNIQUE(user_id, endpoint)` and `idx_user_id` | Web Push device subscriptions added in v0.6.0. One row per (user × browser endpoint), so a single user can receive pushes on every device they've opted in from. Subscriptions returning 404/410 from the push service are pruned in-band by `PushService.sendToUser()`. |
 | `V13__chats_avatar_description.sql` | `chats.avatar_url TEXT`, `chats.description TEXT` | Group avatar (public MinIO URL under `chats/{chatId}/...`) and editable plain-text description (≤500 chars, owner/admin editable). Both nullable; direct chats leave them `NULL`. Added in v0.7.0. |
+| `V14__crypto_foundation.sql` | `device_identity_keys`, `signed_pre_keys`, `pre_keys` tables + 5 columns on `messages` (`encryption_version`, `sender_device_id`, `recipient_device_id`, `pre_key_id`, `signed_pre_key_id`) | Scaffolding for a future Signal-Protocol-style E2EE layer added in v0.8.0. **No encryption is performed yet** — `messages.ciphertext` still holds plaintext, `encryption_version` defaults to 0, and the device-key tables are empty until a client publishes. v0.9.0 will start populating them. |
 
 No schema change was needed for **voice messages** in v0.6.1 — `V3__chat.sql`'s `CHECK (message_type IN ('text', 'image', 'video', 'audio', 'file'))` already permitted `'audio'`. Voice notes are stored as a `messages` row of type `audio` whose `ciphertext` carries `{ url, duration, size }` (mirroring how `file` works).
+
+### v0.8.0 crypto-foundation tables in detail
+
+```sql
+CREATE TABLE device_identity_keys (
+  device_id        UUID PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+  registration_id  INTEGER NOT NULL,           -- Signal-style session disambiguator
+  identity_key     BYTEA NOT NULL,              -- X25519 public, 32 bytes raw
+  signing_key      BYTEA NOT NULL,              -- Ed25519 public, 32 bytes raw
+  key_algorithm    TEXT NOT NULL DEFAULT 'x25519',
+  registered_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE signed_pre_keys (
+  device_id        UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  key_id           INTEGER NOT NULL,
+  public_key       BYTEA NOT NULL,              -- X25519, 32 bytes raw
+  signature        BYTEA NOT NULL,              -- Ed25519 sig over public_key, 64 bytes raw
+  key_algorithm    TEXT NOT NULL DEFAULT 'x25519',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  rotated_at       TIMESTAMPTZ,
+  PRIMARY KEY (device_id, key_id)
+);
+-- Partial index: cheap "current signed pre-key" lookups.
+CREATE INDEX idx_signed_pre_keys_current
+  ON signed_pre_keys (device_id, created_at DESC)
+  WHERE rotated_at IS NULL;
+
+CREATE TABLE pre_keys (
+  device_id        UUID NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  key_id           INTEGER NOT NULL,
+  public_key       BYTEA NOT NULL,              -- X25519, 32 bytes raw
+  key_algorithm    TEXT NOT NULL DEFAULT 'x25519',
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  consumed_at      TIMESTAMPTZ,
+  PRIMARY KEY (device_id, key_id)
+);
+-- Partial index: speeds up the atomic `FOR UPDATE SKIP LOCKED` claim.
+CREATE INDEX idx_pre_keys_unconsumed
+  ON pre_keys (device_id, key_id)
+  WHERE consumed_at IS NULL;
+
+ALTER TABLE messages
+  ADD COLUMN encryption_version  INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN sender_device_id    UUID REFERENCES devices(id) ON DELETE SET NULL,
+  ADD COLUMN recipient_device_id UUID REFERENCES devices(id) ON DELETE SET NULL,
+  ADD COLUMN pre_key_id          INTEGER,
+  ADD COLUMN signed_pre_key_id   INTEGER;
+```
+
+Notes:
+- `encryption_version = 0` is the plaintext default — preserved on every pre-v0.8.0 message and every v0.8.0 send.
+- The `FK ... ON DELETE SET NULL` on the message-level device columns is deliberate: removing a device shouldn't void history, just disconnect the envelope metadata.
+- `signed_pre_keys` and `pre_keys` are owned by `devices`; `ON DELETE CASCADE` removes a device's keys when the device row goes away.
 
 ## Future Tables
 

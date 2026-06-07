@@ -1,5 +1,62 @@
 # Signalix Changelog
 
+## v0.8.0 — 2026-06-07
+
+### Theme
+
+**Encryption foundation.** This release prepares Signalix for a future Signal-Protocol-style E2EE rollout. **No messages are actually encrypted yet** — the server still receives and persists plaintext bodies in `messages.ciphertext`, and the frontend's crypto layer is a passthrough mock. **v0.9.0 will be the real E2EE beta.**
+
+### Added
+
+#### Crypto schema (`Signalix-api`)
+
+- **Migration `V14__crypto_foundation.sql`**:
+  - `device_identity_keys(device_id, registration_id, identity_key, signing_key, key_algorithm, registered_at, updated_at)` — one row per device with the long-term identity + signing public keys + Signal-style registration_id. Upsert on register.
+  - `signed_pre_keys(device_id, key_id, public_key, signature, key_algorithm, created_at, rotated_at)` — rotated periodically; prior rows kept for late handshakes with `rotated_at` set. Partial index `WHERE rotated_at IS NULL`.
+  - `pre_keys(device_id, key_id, public_key, key_algorithm, created_at, consumed_at)` — one-time bundle, atomically claimed by `GET /crypto/users/:userId/key-bundle` (`UPDATE ... WHERE (device_id, key_id) IN (SELECT ... FOR UPDATE SKIP LOCKED)`). Partial index on unconsumed rows.
+  - `messages` ALTERs with five envelope columns: `encryption_version INTEGER NOT NULL DEFAULT 0`, `sender_device_id UUID`, `recipient_device_id UUID`, `pre_key_id INTEGER`, `signed_pre_key_id INTEGER`. Defaults preserve the v0.7.x plaintext flow.
+- All key material is stored as raw `BYTEA`; the API encodes / decodes base64url on the wire.
+
+#### Crypto API endpoints (`Signalix-api`)
+
+| Method | Path | Auth | Purpose |
+|---|---|---|---|
+| POST | `/api/v1/crypto/devices/keys` | JWT | Initial publish of identity / signing / signed-pre-key / first batch of one-time pre-keys. Idempotent. DeviceId always from JWT, never from body. |
+| PATCH | `/api/v1/crypto/devices/keys/signed-pre-key` | JWT | Periodic rotation. Prior signed pre-key marked `rotated_at = NOW()` (kept for in-flight handshakes). |
+| POST | `/api/v1/crypto/devices/keys/pre-keys` | JWT | Top up the one-time pool. Returns the new unconsumed count. |
+| GET | `/api/v1/crypto/users/:userId/key-bundle` | JWT | Return every device bundle for the target user. Each call atomically claims one unconsumed pre-key per device (`FOR UPDATE SKIP LOCKED`); falls back to signed-pre-key-only when the pool is exhausted. |
+
+- New `CryptoModule` (controller + service + DTOs). `class-validator` ensures every key/signature on the wire is base64url and within reasonable size bounds. The DB layer treats all material as opaque blobs — **no signature verification yet** (that lands with v0.9.0 once the protocol is wired).
+
+#### Contracts (`Signalix-contracts`)
+
+- New file `api/crypto.contract.ts` with `DeviceIdentityKeyDTO`, `PreKeyDTO`, `SignedPreKeyDTO`, `DeviceKeyBundleDTO`, `KeyBundleResponse`, `RegisterDeviceKeysRequest/Response`, `RotateSignedPreKeyRequest/Response`, `UploadPreKeysRequest/Response`. Re-exported from `api/index.ts`.
+- `MessageDTO`, `SendMessageRequest`, `ClientMessageSendPayload`, `ServerMessageNewPayload` each gain five optional envelope fields (`encryptionVersion`, `senderDeviceId`, `recipientDeviceId`, `preKeyId`, `signedPreKeyId`). All optional; v0.7.x consumers continue to work unchanged.
+
+#### Frontend crypto scaffolding (`Signalix-frontend`)
+
+- New `src/lib/crypto/` directory:
+  - **`crypto.types.ts`** — re-exports of contracts DTOs + the `CryptoService` interface + `EncryptedEnvelope` shape + `CryptoStatus` (used by debug / settings UI).
+  - **`crypto.service.ts`** — exports a singleton `cryptoService: CryptoService` (currently the mock) plus `getCryptoStatus()`. Swap point: a single line change replaces the implementation when v0.9.0 ships.
+  - **`crypto.mock.ts`** — `MockCryptoService`. `encryptForRecipient` returns `{ ciphertext: plaintext, encryptionVersion: 0 }`; `decryptIncoming` passes plaintext through but surfaces `[encrypted message — upgrade to view]` if it ever receives a non-zero version (lets future-versioned clients coexist without crashing the message list on a stale UI). Dev log: `[signalix-crypto] mock service ready — no E2EE active`.
+- **Not integrated** — the service is NOT yet called from `chat.store.sendMessage` or the WS receive path. The scaffolding exists so v0.9.0's wiring is a focused change at known call sites.
+
+### Read / write of envelope columns (`Signalix-api`)
+
+- `SendMessageDto` widened with `encryptionVersion`, `senderDeviceId`, `recipientDeviceId`, `preKeyId`, `signedPreKeyId` (all `@IsOptional()`, validated with `class-validator`).
+- `MessagesService.sendMessage` INSERTs the new columns; default `encryption_version = 0` keeps existing flows untouched.
+- `ChatsService.getMessages` SELECTs the new columns and maps them onto `MessageDTO` only when non-default — plaintext rows stay clean in the JSON response.
+
+### Not changed
+
+- Direct chats, group chats, media, files, voice notes, reactions, replies, forwards, edit, delete, sidebar + in-chat search, push notifications — **all continue to work as v0.7.1**.
+- Realtime service untouched. The new envelope fields ride on the existing WS payloads as additive optional properties; no new events.
+- Infra: no new buckets, services, or env vars. Migration V14 is applied by the existing Flyway service.
+
+### Roadmap signal
+
+- **v0.9.0 — E2EE beta**: real X25519 / Ed25519 keypair generation in the browser, signed pre-key signature verification on publish, X3DH-style handshake on first message, Double Ratchet for ongoing sessions, multi-device fanout. Backend signature verification, key rotation policies, key-server abuse protections. Client-side IndexedDB store for session state.
+
 ## v0.7.1 — 2026-06-07
 
 ### Added

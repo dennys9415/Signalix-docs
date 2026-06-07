@@ -1,5 +1,77 @@
 # Signalix Changelog
 
+## v0.9.0 — 2026-06-07
+
+### Fixed (post-initial-cut)
+
+- **Realtime envelope forwarding (`Signalix-realtime`).** The first cut of v0.9.0 missed two lines in `ws/event-router.onMessageSend`:
+  - The `api.sendMessage(...)` call did not extract the envelope fields (`encryptionVersion`, `senderDeviceId`, `recipientDeviceId`, `preKeyId`, `signedPreKeyId`) from the incoming WS payload, so the API persisted rows with `encryption_version = 0` and envelope columns `NULL`.
+  - The construction of `ServerMessageNewPayload` did not spread the same fields from the API's returned `MessageDTO`, so recipients received the JSON envelope as raw ciphertext without the `encryptionVersion >= 1` flag that triggers the client decrypt path. The chat UI rendered `{"v":1,"c":"…","iv":"…","eph":"…"}` verbatim instead of decrypted plaintext.
+- **`common/api-client.sendMessage` payload type widened** with the five optional envelope fields.
+- **`signal.service.decryptIncoming` init-race protection (`Signalix-frontend`).** A `MESSAGE_NEW` arriving between login and the completion of the initial key publish used to hit empty IndexedDB and fall through to `[Unable to decrypt message]`. `decryptIncoming` now `await`s the service's in-flight `initPromise` before doing IDB lookups.
+- **Dev diagnostics.** `signal.service.decryptIncoming` logs `[signalix-crypto] decrypt attempt` (with `version`, `signedPreKeyId`, `preKeyId`) and `[signalix-crypto] decrypt success`. `chat.store.decryptStoredMessage` logs `[signalix-crypto] decrypt failed` with the reason on the catch path. All log calls are gated on `NODE_ENV !== 'production'`.
+
+### Theme
+
+**Signal Protocol Beta for direct chats.** v0.9.0 turns the v0.8.0 foundation into a working — if simplified — end-to-end encryption layer for **direct text messages only**. Groups, images, files, voice notes, reactions, replies, forwards, edit, and delete all continue to flow as before; only the body of a direct TEXT message gets sealed before it leaves the sender's browser.
+
+> ⚠️ **Beta — not production-grade.** No Double Ratchet, no signature verification yet, single-device assumption, no per-message forward secrecy beyond signed-pre-key rotation. **v0.10.0 hardens this**: multi-device fan-out, Double Ratchet, Ed25519 signature verification, one-time pre-key deletion after use, encrypted push previews, key-verification UX. v0.11.0+ extends encryption to groups and media.
+
+### Added
+
+#### Frontend Signal service (`Signalix-frontend`)
+
+- **`src/lib/crypto/signal.service.ts`** — `SignalCryptoService implements CryptoService`. Real Web Crypto.
+  - **Identity**: X25519 (ECDH) + Ed25519 (signing). Generated on first `init({ deviceId })`; published once via `POST /crypto/devices/keys`; persisted as live `CryptoKey` instances in IndexedDB.
+  - **Signed pre-key**: X25519, signed with the device's Ed25519 key, published in the same initial call.
+  - **One-time pre-keys**: 100 generated up front; auto top-up when the local pool drops below 20.
+  - **Encrypt path**: ephemeral X25519 keypair → `ECDH(eph, recipientSPK) || ECDH(eph, recipientOTP)` → HKDF-SHA256 with `info="signalix-v1-direct-text"` → AES-256-GCM with 12-byte random IV. Envelope on the wire is `JSON.stringify({ v: 1, c, iv, eph })` (all values base64url) carried in `messages.ciphertext`. The 5 envelope columns from v0.8.0 carry the routing metadata.
+  - **Decrypt path**: parses the envelope, looks up the local signed-pre-key + one-time pre-key by id, reverses the ECDH, derives the same AES key. Failure → `"[Unable to decrypt message]"` sentinel.
+- **`src/lib/crypto/db.ts`** — IndexedDB schema `signalix-crypto-v1` with stores `identity`, `signed-pre-keys`, `pre-keys`, `plaintext-cache`. CryptoKey instances stored directly via structured clone.
+- **`src/lib/crypto/plaintext-cache.ts`** — local plaintext cache so the sender can re-render their own outgoing text after a history reload.
+- **`src/lib/crypto/utils.ts`** — base64url, X25519 / Ed25519 raw public-key importers, HKDF → AES-256-GCM helper. `Uint8Array<ArrayBuffer>` return types so strict-TS Web Crypto signatures accept them.
+- **`crypto.service.ts` swap point** — picks `SignalCryptoService` by default, falls back to the v0.8.0 `MockCryptoService` when `NEXT_PUBLIC_E2EE_DEV_FALLBACK=true`.
+
+#### `auth.store` (`Signalix-frontend`)
+
+- Every successful auth path (hydrate / login / register / loginWithOAuth / silent refresh) now fires `cryptoService.init({ deviceId })` in the background. Errors logged with `[signalix-crypto] init failed`; never blocks auth.
+
+#### `chat.store` integration (`Signalix-frontend`)
+
+- **`sendMessage`** for direct + TEXT + non-draft messages encrypts via `cryptoService.encryptForRecipient` before WS send. Plaintext fallback on every failure mode so transitioning users never lose messages.
+- **`MESSAGE_NEW` handler** carries the envelope fields through, inserts the encrypted body, then in a follow-up tick decrypts and replaces the ciphertext in the store.
+- **`MESSAGE_SENT` handler** caches the sender's plaintext keyed by the freshly-assigned `messageId`.
+- **`loadMessages`** runs every history page through `decryptStoredMessage` (cache lookup → live decrypt → sentinel) before insertion.
+
+#### UX (`Signalix-frontend`)
+
+- Direct-chat header shows a **🔒 End-to-end encrypted beta** pill next to the presence row. Hidden for drafts and groups.
+- Messages whose ciphertext is `"[Unable to decrypt message]"` render with an italic + open-padlock treatment in muted color.
+
+#### Build / infra (`Signalix-infra`, `Signalix-frontend`)
+
+- **`NEXT_PUBLIC_E2EE_DEV_FALLBACK`** new build-arg / env var. Default `false`. Wired in `Signalix-frontend/Dockerfile` and `docker-compose.yml` `frontend.build.args`.
+- **`Signalix-frontend/.env.example`** documents the flag.
+
+### Not changed
+- All v0.8.0 crypto endpoints, contracts, DB schema (V14) — unchanged. The v0.9.0 frontend simply starts using them.
+- Group chats, image messages, file attachments, voice notes, reactions, replies, forwards, edit, delete, search, push — keep working exactly as v0.8.0.
+- Realtime service untouched. Envelope fields ride on existing WS payloads as additive optional properties.
+
+### Known limitations
+- **No Double Ratchet** — single ephemeral keypair per message; forward secrecy bounded by signed-pre-key rotation.
+- **No multi-device fan-out** — sender picks the first device bundle returned by the API.
+- **No signature verification** on signed pre-keys server-side.
+- **Pre-keys not deleted locally** after first use.
+- **Sender history** on a brand-new browser shows `"[Unable to decrypt message]"` for messages sent from the previous device.
+- **Push notification previews** still read the encrypted ciphertext.
+- **No safety-number / key-verification UX.**
+- **Groups, images, files, voice notes** remain plaintext on the server.
+
+### Roadmap signal
+- **v0.10.0** — Double Ratchet, multi-device fan-out, signed-pre-key signature verification, one-time pre-key deletion after use, encrypted push previews, key-verification UX, automatic signed-pre-key rotation.
+- **v0.11.0+** — group encryption (Sender Keys), media / file / voice encryption (encrypt-then-upload), key change notifications.
+
 ## v0.8.0 — 2026-06-07
 
 ### Theme

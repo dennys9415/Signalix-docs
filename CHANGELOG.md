@@ -1,5 +1,56 @@
 # Signalix Changelog
 
+## v0.11.0 — 2026-06-08
+
+### Theme
+
+**Media / file / voice E2EE beta.** Image, file, and voice attachments
+are now encrypted client-side before upload — the API and MinIO only
+ever see opaque AES-256-GCM ciphertext. The per-attachment media key
+rides inside the existing per-recipient envelope (same X3DH-style
+fan-out that protects text since v0.10.x), so multi-device works
+automatically and no new key-management surface was introduced.
+
+### Added
+
+#### Client-side file encryption (`Signalix-frontend`)
+- **`src/lib/crypto/file-crypto.ts`** — `encryptFile(blob)` returns `{ ciphertext, key, iv }` using a freshly generated 32-byte AES-256-GCM key + 12-byte IV. `decryptFile(ciphertext, key, iv)` for the recipient side. Plus base64url wire encoders/decoders for the key + IV (`encodeKeyForWire`, `decodeKeyFromWire`, …) and the `MediaMetadataV1` type that describes the in-envelope JSON.
+- **`src/lib/crypto/use-decrypted-blob-url.ts`** — `useDecryptedBlobUrl(info)` React hook that fetches the encrypted blob, decrypts it in memory, and exposes a one-shot `blob:` URL for `<img>` / `<audio>` to render against. Cleans up via `URL.revokeObjectURL` on unmount or when the input changes. Companion `downloadDecryptedAttachment` for file save-as flows.
+
+#### Encrypt-then-upload entry points (`Signalix-frontend`)
+- **`MessageInput.tsx`** — image / file / voice paths now run `encryptFile` → `uploadEncryptedBlob` → build `MediaMetadataV1` JSON (`{ v:1, url, k, iv, mime, size, filename?, duration? }`) → ship it via `onSend` as the message ciphertext. The store's per-recipient envelope encrypts the JSON, so the server never sees the URL ↔ key pair together.
+- **`uploadEncryptedBlob(ciphertext)`** in `lib/api-client.ts` — `POST /api/v1/media/encrypted-blob`, returns `{ url, size }`.
+
+#### Encrypted-blob upload endpoint (`Signalix-api`)
+- **`POST /api/v1/media/encrypted-blob`** in `MediaController` — accepts opaque ciphertext bytes up to 25 MB. Object key format `encrypted/{userId}/{uuid}.bin` under the existing media bucket. MIME validation is skipped on purpose (the bytes are random-looking ciphertext); size cap matches the largest pre-v0.11.0 attachment kind (files).
+- **`MessagesService.sendMessage`** lifted the `messageType === TEXT` guard on `recipients[]`. IMAGE / FILE / AUDIO can now be sent via the per-recipient envelope path.
+
+#### Receive-side wiring (`Signalix-frontend`)
+- **`chat.store.decryptStoredMessage`** no longer short-circuits on non-TEXT. For IMAGE / FILE / AUDIO the decrypted "plaintext" is the metadata JSON, which the renderers re-parse to grab the URL + key + IV.
+- **`MessageView.tsx`** — new `ImageBubble` component (renders via `useDecryptedBlobUrl`), updated `VoiceBubbleSection` (passes the blob URL to `VoiceBubble`), updated `FileCard` (download path uses `downloadDecryptedAttachment` for encrypted files; legacy plaintext files still go through `/files/:id/download`). New `BrokenAttachment` tile for `[Unable to decrypt attachment]`.
+- **`DECRYPT_FAILED_ATTACHMENT_PLACEHOLDER`** exported from `crypto.service` — used for the media sentinel; existing `[Unable to decrypt message]` continues to cover TEXT.
+
+#### Tests
+- `src/lib/crypto/file-crypto.test.ts` — 6 unit tests covering roundtrip, ciphertext != plaintext, fresh key/IV per call, tamper rejection, wrong-length key/IV rejection, base64url wire roundtrip. **16/16 frontend tests passing total.**
+
+### Fixed
+- Media bubbles that previously rendered the raw URL now decrypt to a blob URL — the server can never link "this image URL" to "Alice sent it to Bob" beyond the WS metadata it already sees.
+
+### Not changed
+- WS protocol (only the contents of `ciphertext` shifted from URL/legacy-JSON to the new metadata schema; no new events or DTO fields).
+- Database schema. The MinIO bucket structure is additive (`encrypted/` prefix joins the existing `messages/` and `voice/` prefixes).
+- Direct + group TEXT E2EE — unchanged.
+- Legacy plaintext rows still render correctly (`parseImageInfo` / `parseFileInfo` / `parseVoiceInfo` fall back when no `v:1` envelope is detected).
+
+### Known limitations (intentional)
+- **No backup / recovery.** Lose the message envelope, lose access to that attachment forever — the media key only lives inside the per-recipient envelope.
+- **Link previews, avatars, profile photos remain plaintext.** Scope-limited to message attachments.
+- **No streaming decrypt.** The entire ciphertext is loaded into memory before AES-GCM open. Acceptable up to the 25 MB cap; revisit when raising it.
+- **The encrypted blob is at a public MinIO URL.** Knowing the URL only grants access to ciphertext, which is useless without the media key, so this is intentional — but anyone who saw the URL via the wire (no one in practice, since the URL itself is inside the envelope) could replay-fetch. Future hardening could move to signed URLs.
+
+### Roadmap signal
+- **v0.12.0+** — Sender Keys for groups (drop the O(participants) cost on text + attachments alike), encrypted push previews, signed-URL media access, link-preview encryption.
+
 ## v0.10.1 — 2026-06-08
 
 ### Theme

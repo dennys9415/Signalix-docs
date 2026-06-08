@@ -1,5 +1,139 @@
 # Signalix Changelog
 
+## v0.10.1 — 2026-06-08
+
+### Theme
+
+**E2EE multi-device hygiene + realtime group surface.** v0.10.1 closes the
+intermittent decrypt failures that surfaced after the v0.10.0 group
+beta — almost all of them traced back to two interacting bugs:
+**(a)** the sender's single-device assumption (picking `bundles[0]`)
+silently locked out a recipient's second browser, and **(b)** the
+v0.9.1 reset detection wiped the local IDB without telling the server,
+leaving the bundle endpoint to keep handing out orphan one-time
+pre-key ids the device no longer had. v0.10.1 fans direct E2EE out to
+every recipient device (matching v0.10.0's group path), keys the
+per-recipient payload map by `deviceId` instead of `userId` so each
+device gets *its* envelope, and teaches the API to scrub a device's
+prior pre-keys on identity change. A one-time forced-cleanup is added
+to the client so existing deployments converge without a manual purge.
+
+The realtime layer also gains its first non-message broadcast:
+`server.chat.created` makes a newly-created group appear in every
+participant's sidebar immediately, without a manual refresh.
+
+### Added
+
+#### Multi-device direct fan-out (`Signalix-frontend`, `Signalix-api`)
+- **`SignalCryptoService.encryptForUserAllDevices(plaintext, recipientUserId)`** — fetches the recipient's full bundle list and encrypts the same plaintext separately for every device. Replaces the v0.9.x `bundles[0]` single-device assumption that broke Brave + Chrome on the same account.
+- **`chat.store.dispatchSend` / `dispatchEdit`** for direct chats now uses the same per-recipient `recipients[]` shape as group sends. Direct + group are unified on the same fan-out plumbing.
+- **`MessagesService.sendMessage` / `editMessage`** no longer reject `recipients[]` for direct chats — the `chatType !== GROUP` guard was lifted.
+
+#### Per-device payload routing (`Signalix-api`, `Signalix-realtime`, `Signalix-contracts`)
+- **`recipientPayloads` keyed by `deviceId`** (not `userId`). When a recipient has two devices (Brave + Chrome), the map now holds both entries instead of last-write-wins overwriting one. `RecipientEnvelopeDTO`'s comment updated.
+- **`ChatsController.getMessages`** accepts the caller's `deviceId` from the JWT and forwards it to the service; **`ChatsService.getMessages`** JOINs `group_message_recipients` on `(recipient_user_id, recipient_device_id)` so a multi-device user no longer gets duplicate rows per message.
+- **Realtime `event-router.onMessageSend` / `onMessageEdit`** look up `recipientPayloads[participantConn.deviceId]` per-connection, so each device receives its own envelope.
+
+#### Server-side stale-key hygiene (`Signalix-api`)
+- **`CryptoService.registerDeviceKeys`** detects an identity-key change versus the row already stored and, in the same transaction, **`DELETE`s** the device's prior `signed_pre_keys` + `pre_keys` before inserting the new material. Without this, the bundle endpoint kept handing out orphan one-time pre-key ids that the recipient's IDB no longer held → `Local one-time pre-key X not found`.
+- API-side `Logger` lines on register / upload / bundle so the cleanup is observable in deploy logs.
+
+#### Forced one-time cleanup (`Signalix-frontend`)
+- **`localStorage['signalix-stale-prekey-cleanup-v1']`** — on the first init after the v0.10.1 deploy on each device, the client wipes its local identity / SPKs / pre-keys / fingerprints (**preserving the plaintext cache** so sender history survives) and re-registers. The server-side identity-change detection above then purges the orphan rows. Idempotent: subsequent inits no-op.
+
+#### Decrypt-failure cache life cycle (`Signalix-frontend`)
+- **`clearDecryptFailureCache()`** runs on every successful `cryptoService.init()`. A transient failure from a previous session (init race, the v0.9.0 envelope-drop bug, etc.) auto-heals on the next page load; a genuinely broken message re-caches for the current session.
+
+#### MESSAGE_NEW flicker fix (`Signalix-frontend`)
+- `chat.store` decrypts encrypted-text messages **before** inserting them into the store. The bubble used to render the raw envelope JSON for ~50ms until the async decrypt finished and replaced it; now it appears directly with plaintext. Browser notifications also use the decrypted plaintext as preview body (instead of the envelope JSON).
+
+#### `server.chat.created` realtime broadcast (`Signalix-contracts`, `Signalix-api`, `Signalix-realtime`, `Signalix-frontend`)
+- New `ClientEvent.CHAT_CREATED` + `ServerEvent.CHAT_CREATED` with `ClientChatCreatedPayload { chatId }` and `ServerChatCreatedPayload { chat: ChatDTO }`.
+- New `GET /api/v1/chats/:chatId` → `{ chat: ChatDTO }`. Forbidden for non-participants, 404 if the chat doesn't exist. Used by the realtime layer to fetch the canonical DTO with the caller's JWT (auth check + DTO retrieval in one call).
+- Realtime `onChatCreated`: re-fetches the canonical chat, seeds `cm.learnChatParticipants` so subsequent message sends route to every participant immediately, then fans `server.chat.created` out to every participant connection (skipping the originating device).
+- Frontend `chat.store.createGroupChat` fires `wsClient.sendChatCreated({ chatId })` after the REST response; the WS handler dedupes by `chat.id` so the originator (who already inserted the chat from REST) doesn't double-insert.
+
+#### Diagnostic logging (`Signalix-frontend`, `Signalix-api`)
+- Frontend `CRYPTO_DEBUG_LOGS` runtime constant (defaults to dev-only). When flipped to `true` it surfaces the full crypto trail in production: `env probe` (deviceId, isBraveDetected), `encryptForUserAllDevices` (bundle ids), `preKey selected by sender`, `preKey consumed locally`, `decrypt attempt`, `decrypt success`/`decrypt failed` (with the entire local key inventory: `localSignedPreKeyIds`, `localUnconsumedPreKeyIds`, `localTotalPreKeyCount`, `spkLookup`, `preKeyLookup`, `preKeyAlreadyConsumed`, `reason`).
+- AES-GCM auth-tag failures now throw with a descriptive reason instead of Web Crypto's opaque `OperationError`.
+- API `CryptoService.registerDeviceKeys`, `uploadPreKeys`, `getKeyBundle` emit Nest `Logger` lines with the relevant key ids so the server log shows exactly which pre-key was claimed for each bundle hand-out.
+
+### Fixed
+- **Intermittent "Unable to decrypt message" on direct chats.** Combination of the multi-device fan-out, per-device payload routing, server-side stale-key wipe, and forced cleanup. Confirmed by side-by-side `decrypt success` / `decrypt failed` diagnostic logs.
+- **Brave-only decrypt failure** when the user was logged into Chrome and Brave on the same account. Symmetric: Chrome-only failure if Brave registered second.
+- **MESSAGE_NEW envelope JSON flash** between WS receipt and async decrypt.
+- **Push / in-app notification preview** for encrypted text used to show the raw envelope JSON; now shows the decrypted plaintext (or the failure placeholder).
+- **Group chat doesn't appear in participants' sidebar until refresh.** Closed by `server.chat.created`.
+
+### Not changed
+- WS protocol semantics, REST routes (only added — no breaking changes), DB schema (no new migrations).
+- Direct E2EE single-device path still encrypts correctly; multi-device is additive.
+- Realtime layer architecture (still in-memory routing cache, no Redis).
+
+### Operational notes
+- Deploy order: contracts → api → realtime → frontend. (Same as v0.10.0; contracts is build-time only.)
+- After deploy each device runs the forced cleanup exactly once. Server logs will show a burst of `Identity key changed for device X; wiping stale SPKs + pre-keys server-side.` lines — that's expected for the first day or two as devices come online.
+- No `Signalix-infra` changes — no new env vars, no new services, no schema migration.
+
+## v0.10.0 — 2026-06-07
+
+### Theme
+
+**Group E2EE beta — text only.** v0.10.0 extends the direct-text E2EE from v0.9.x to group chats via **per-recipient encryption fan-out**: the sender runs the v0.9.x X3DH-style handshake N times (once per recipient) and ships N envelopes, one for each device that should be able to decrypt. The server stores each envelope in a new `group_message_recipients` table and the realtime layer delivers each recipient only their own copy.
+
+> ⚠️ **Beta.** Per-recipient fan-out, **not** production-grade Sender Keys. The per-message cost is `O(participants)` for both encrypt and bandwidth — fine for small groups, not for thousands. Sender Keys is a v0.11.0+ goal. **Group media (images, files, voice notes) remain plaintext on the server in v0.10.0.** New joiners cannot decrypt history (intentional — they have no recipient row for older messages).
+
+### Added
+
+#### Server / database (`Signalix-api`)
+
+- **Migration `V15__group_message_recipients.sql`** — one row per (message × recipient × device) for group encrypted text sends. Columns: `message_id`, `recipient_user_id`, `recipient_device_id`, `ciphertext`, `encryption_version`, `pre_key_id`, `signed_pre_key_id`, `created_at`. PK = `(message_id, recipient_user_id, recipient_device_id)`. Index on `(recipient_user_id, message_id)` for the history-fetch JOIN. `ON DELETE CASCADE` from `messages` so a delete-for-everyone cleans up the per-recipient rows.
+- **`MessagesService.sendMessage` fan-out path.** When `recipients[]` is provided and the chat is a group and the message is TEXT, the service: validates each recipient is a participant (and is not the sender), writes one row into `messages` with empty ciphertext + `encryption_version=1`, inserts N rows in `group_message_recipients`, and returns `recipientPayloads: Record<UUID, RecipientEnvelopeDTO>` so the realtime layer can fan out per-recipient.
+- **`MessagesService.editMessage` re-fan-out.** Same shape on edit: the service deletes the existing `group_message_recipients` rows and inserts the new set within the same transaction, then returns the per-recipient payload map. Direct E2EE edits also pick up envelope re-routing on the same DTO (`encryptionVersion`, `senderDeviceId`, `recipientDeviceId`, `preKeyId`, `signedPreKeyId`).
+- **`ChatsService.getMessages`** now `LEFT JOIN`s `group_message_recipients` on `recipient_user_id = caller.id` and replaces the top-level `ciphertext` / envelope columns with the per-recipient row's values when present. Senders + non-recipients see the empty sentinel ciphertext (which the frontend's plaintext-cache + failure-cache turns into either the cached plaintext or `[Unable to decrypt message]`).
+- **Push preview** for an empty top-level ciphertext (group encrypted send) becomes the generic `🔒 New encrypted message` instead of a blank body.
+
+#### Realtime (`Signalix-realtime`)
+
+- **Per-recipient broadcast** in `event-router.onMessageSend` and `onMessageEdit`. When the API response carries `recipientPayloads`, the router builds a personalized `server.message.new` / `server.message.edited` per participant: each recipient gets only the ciphertext + envelope encrypted to *their* device. Non-recipients (or recipients without a key bundle published) fall back to the top-level row, which for a group encrypted send is the empty sentinel.
+- **`common/api-client.sendMessage`** signature widened with `recipients?: GroupRecipientPayloadDTO[]`.
+- **`common/api-client.editMessage`** now takes a payload object (was `ciphertext` positional) so it can forward envelope fields + `recipients`.
+
+#### Frontend (`Signalix-frontend`)
+
+- **`chat.store.dispatchSend` group path.** For group + TEXT + non-draft sends, the store now: resolves participant userIds (excluding self), runs `cryptoService.encryptForRecipient` once per recipient in parallel, builds `recipients[]`, and ships the WS frame with empty top-level ciphertext + `recipients`. If **any** recipient encryption fails the whole send falls back to plaintext (no partial leak).
+- **`chat.store.dispatchEdit`.** Symmetric path for edits. Re-encrypts the new plaintext per recipient and ships the recipients map. Sender-side plaintext cache is updated optimistically so a later refresh keeps showing the edit.
+- **`MessageView` header pill.** Group chats now show the same `🔒 End-to-end encrypted beta` pill as direct chats, with a tooltip noting "media, files, and voice notes are not encrypted."
+
+#### Contracts (`Signalix-contracts`)
+
+- **New `GroupRecipientPayloadDTO`** in `api/message.contract.ts` (`recipientUserId`, `recipientDeviceId`, `ciphertext`, `encryptionVersion`, optional `preKeyId` + `signedPreKeyId`).
+- **New `RecipientEnvelopeDTO`** for the API → realtime fan-out map.
+- **Extended `SendMessageRequest`, `EditMessageRequest`, `ClientMessageSendPayload`, `ClientMessageEditPayload`** with `recipients?: GroupRecipientPayloadDTO[]` plus envelope-passthrough fields on edit.
+- **Extended `SendMessageResponse`, `EditMessageResponse`** with `recipientPayloads?: Record<UUID, RecipientEnvelopeDTO>`.
+- **Extended `ServerMessageEditedPayload`** with optional envelope fields so per-recipient edits ride on the existing event.
+
+### Not changed
+
+- Direct E2EE — every v0.9.x property carries over byte-for-byte. The direct send/edit paths short-circuit before the group fan-out resolver.
+- Reactions, delete-for-me, delete-for-everyone, status updates, typing, presence — all unchanged.
+- Image / file / voice messages, link previews on plaintext text, search (the search endpoint won't match the encrypted body — same as v0.9.x direct).
+- WS event names. v0.10.0 reuses `client.message.send`, `server.message.new`, `client.message.edit`, `server.message.edited`; the new fields are optional and additive.
+
+### Known limitations
+
+- **Per-recipient cost.** Send latency and bandwidth scale linearly with participant count. Acceptable for small groups; Sender Keys is the path forward (v0.11.0+).
+- **No multi-device fan-out yet.** Single-device assumption from v0.9.x carries over — the sender uses the first bundle per recipient.
+- **New joiners don't decrypt history.** Intentional consequence of the fan-out: a member added after the fact has no recipient row in `group_message_recipients`, so old messages render as `[Unable to decrypt message]`.
+- **Reply previews to a group encrypted message show an empty quote bubble.** The reply preview reads `messages.ciphertext` (the sentinel) and v0.10.0 does not extend it with the per-recipient JOIN. v0.11.0 will.
+- **Group media, files, voice notes remain plaintext on the server.**
+- **Push notification previews** for group encrypted sends show the generic `🔒 New encrypted message` rather than the message body.
+
+### Roadmap signal
+
+- **v0.11.0** — Sender Keys for groups (constant-cost per send), group media / file / voice encryption, encrypted push previews, per-recipient JOIN in reply previews.
+- **v0.12.0+** — multi-device fan-out, safety-number verification UI surfacing the v0.9.1 fingerprint store.
+
 ## v0.9.1 — 2026-06-07
 
 ### Theme

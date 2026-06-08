@@ -1,5 +1,61 @@
 # Signalix Changelog
 
+## v0.13.0 — 2026-06-08
+
+### Theme
+
+**Message search (E2EE-aware).** Global + in-chat search across
+text, filenames, group names, and usernames — with a critical caveat
+the v0.7.1 search predates: v0.10.0+ encrypted message bodies live
+in per-recipient envelopes the server can't open. v0.13.0 keeps the
+server's ILIKE for the metadata it CAN see (group titles, sender
+usernames, legacy plaintext rows) and pairs it with a client-side
+walk over the in-memory message store so decrypted bodies and
+encrypted-attachment filenames are findable too. The UI merges both
+result sets dedup-by-messageId. A new full-screen mobile overlay
+replaces the cramped inline sidebar search on phones.
+
+### Added
+
+#### Server-side search extension (`Signalix-api`)
+- **`MessagesService.searchMessages`** WHERE clause now matches **any of**: `messages.ciphertext` (legacy plaintext rows; empty for v0.10.0+ encrypted), `chats.title` (group titles), `sender.username`, `sender.display_name`. Previous behaviour was ciphertext-only.
+- **`ChatsService.searchInChat`** same extension scoped to a single chat: ciphertext OR sender username OR sender display_name.
+- Both keep their existing per-user-deletion + chat-deletion visibility cutoffs and keyset pagination.
+
+#### Client-side local search (`Signalix-frontend`)
+- **`src/lib/local-search.ts`** *(new)* — `searchLocalMessages(query, inputs, opts)` walks `chat.store.state.messages` + `state.chats`:
+  - TEXT messages: matches against the already-decrypted body the store carries after `decryptStoredMessage`.
+  - IMAGE / FILE / AUDIO: parses `MediaMetadataV1` JSON and matches `filename`.
+  - Skips the `[Unable to decrypt message]` / `[Unable to decrypt attachment]` sentinels so they don't pollute results.
+  - Emits records in the same `MessageSearchResultDTO` shape the server endpoint returns.
+- **`searchLocalChatMessages`** — single-chat variant emitting `InChatSearchMatchDTO`.
+- **`mergeSearchResults` / `mergeInChatResults`** — dedup by `messageId`, local entry wins (has the real decrypted plaintext where the server only has the empty sentinel).
+
+#### UI integration (`Signalix-frontend`)
+- **`ChatSidebar`** — `handleSearchChange` and `loadMoreMessageResults` now fan out server + local search in parallel and merge results.
+- **`MessageView` in-chat search effect** — same merge. The existing X-of-Y counter, up/down nav, scroll-to, and `signalix-search-hit` highlight (already shipped in v0.7.1) work unchanged.
+- **`MobileSearchOverlay.tsx`** *(new)* — full-screen modal triggered by tapping the sidebar search input on mobile. Own input + result list (People + Messages sections) + tap-to-open routing to `/chats/:id?m=:messageId`. Desktop is unchanged.
+
+#### Tests (`Signalix-frontend`)
+- **`lib/local-search.test.ts`** *(new)* — 8 cases: text body case-insensitive match, filename match inside `MediaMetadataV1`, miss controlled, decrypt-failure sentinel skipping, single-chat filter, newest-first sort, merge dedup with local priority, server-only emit. 29/29 frontend tests passing total.
+
+### Fixed
+- v0.7.1 search would return zero matches for v0.10.0+ encrypted message bodies (`messages.ciphertext = ''`). Client-side walk closes that blind spot for any message the user has actually loaded.
+
+### Not changed
+- The wire shapes (`MessageSearchResultDTO`, `InChatSearchMatchDTO`, request/response wrappers) are unchanged. No contract bump.
+- WS protocol, fan-out, E2EE pipeline, media encryption, safety-number flow — all untouched.
+- The realtime layer is a no-op for this release.
+
+### Known limitations (intentional)
+- **Local search only sees messages the user has loaded into the store.** Older history in chats they've never opened isn't indexed client-side. The server side covers what it can (titles, usernames, legacy plaintext).
+- **No vector / semantic search.** ILIKE-only per spec.
+- **No fuzzy matching** (typos, stems). Exact substring case-insensitive.
+- **Server-side ILIKE is blind to encrypted bodies** by design — that's the whole point of E2EE; the client-side walk is the deliberate compensating mechanism.
+
+### Roadmap signal
+- **v0.14.0+** — PostgreSQL full-text index on `chats.title` + `users.username` for larger deployments; bulk-decrypt-and-index on the client so non-loaded history becomes searchable too.
+
 ## v0.12.0 — 2026-06-08
 
 ### Theme

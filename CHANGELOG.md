@@ -1,5 +1,60 @@
 # Signalix Changelog
 
+## v0.12.0 — 2026-06-08
+
+### Theme
+
+**Safety number / device verification UI.** The fingerprint
+foundation that shipped in v0.9.1 is now surfaced in the chat
+profile: users can read the 12-group safety number, scan a QR code,
+mark a peer as verified, and get an automatic "Security number
+changed" warning when either side's identity key rotates. v0.9.1 +
+v0.11.0 fan-out continue to drive the encryption itself — v0.12.0
+just gives users the tools to confirm *who* they're talking to.
+
+### Added
+
+#### Verification state (`Signalix-frontend`)
+- **`FingerprintRecord`** in `lib/crypto/db.ts` carries a verification snapshot: `verifiedAt`, `verifiedLocalIdentityKey`, `verifiedPeerIdentityKey`, `verifiedSafetyNumber`. The snapshot is frozen at the moment of the "Mark as verified" click so a later silent identity rotation can be detected by diff.
+- **`deriveVerificationStatus(record, currentLocalKey, currentPeerKey)`** — pure function returning `'unknown' | 'unverified' | 'verified' | 'changed'`. `'changed'` fires when the current identity keys diverge from the verified snapshot (either side rotating triggers it).
+- **`markPeerVerified` / `unmarkPeerVerified`** helpers + the upsert path in `cacheSafetyNumber` that preserves the snapshot when refreshing the "current view".
+
+#### Service API (`Signalix-frontend`)
+- **`SignalCryptoService.getPeerVerification(peerUserId)`** — single call that fetches the peer's current bundle (so a key rotation is detected immediately), validates the Ed25519 signature (v0.9.1 hardening still applies), refreshes the cached fingerprint, and returns `{ status, safetyNumber, localIdentityKey, peerIdentityKey, verifiedAt, verifiedSafetyNumber }`.
+- **`SignalCryptoService.markPeerVerified(peerUserId)` / `unmarkPeerVerified(peerUserId)`** — wraps the IDB helpers.
+- `CryptoService` interface + `MockCryptoService` updated accordingly.
+
+#### UI (`Signalix-frontend`)
+- **New `EncryptionPanel` inside `ContactProfileModal`** for direct chats:
+  - "End-to-end encrypted beta" pill.
+  - Safety number rendered as 2 rows of 6 × 5-digit groups, selectable.
+  - QR code (160×160) carrying `signalix-safety:<number>` so two devices can compare visually.
+  - Status badge: *Verified • <date>* / *Not verified* / *No longer verified*.
+  - Button: *Mark as verified* (or *Unverify* / *Re-verify* depending on status).
+  - Amber warning panel when status is `'changed'`: **"Security number changed — Confirm the new number with them before resuming sensitive conversations."**
+  - Loading + retry states for the bundle fetch.
+- New `qrcode` dependency (+ `@types/qrcode`).
+
+#### Tests
+- `fingerprints.test.ts` — 5 new cases on `deriveVerificationStatus` (unknown / unverified / verified / changed-by-peer / changed-by-local). 21/21 frontend tests passing total.
+
+### Fixed
+- The previously-orphan v0.9.1 fingerprint cache (computed but never displayed) finally has a user-facing surface.
+
+### Not changed
+- No DB migration. No new API endpoints — the verification state lives entirely in client IndexedDB.
+- No contract changes. The realtime layer is untouched.
+- Direct E2EE, group E2EE, media E2EE, recipient routing — all unchanged.
+
+### Known limitations (intentional, per scope)
+- **No production trust model.** Verification is local to each device's IDB. Wiping browser storage resets the verified flag for every peer.
+- **No cloud key backup or account recovery.** Same model as the rest of the E2EE stack.
+- **No group safety numbers.** v0.12.0 covers direct chats only — groups need a different ceremony (or Sender Keys, v0.13.0+).
+- **No media-specific verification.** Attachment metadata flows through the same per-recipient envelope as text; verification status is per-peer, not per-message.
+
+### Roadmap signal
+- **v0.13.0+** — Sender Keys for groups; group safety numbers; encrypted push previews; signed-URL media access.
+
 ## v0.11.0 — 2026-06-08
 
 ### Theme

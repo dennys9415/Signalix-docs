@@ -1,5 +1,66 @@
 # Signalix Changelog
 
+## v0.15.0 — 2026-06-09
+
+### Theme
+
+**Key backup & device recovery.** Users can now export every byte of
+their device's crypto state — identity keys, signed pre-keys,
+one-time pre-keys, peer fingerprints, plaintext cache — into a
+single `.sbk` file encrypted with a 12-word recovery phrase. Restore
+the file + phrase on a new device (or after wiping the browser's
+IndexedDB) and previously-encrypted chats decrypt again. The server
+never sees the phrase or the plaintext keys — encryption is
+end-to-end between the user and themselves.
+
+### Added
+
+#### Recovery phrase (`Signalix-frontend`)
+- **`src/lib/crypto/bip39.ts`** *(new)* — Signalix recovery phrase wordlist + helpers.
+  - 256-word curated English wordlist (3-7 letters, no homophones, no look-alike pairs, easy to write down). Each word maps to 8 bits; 12 words = 96 bits of base entropy.
+  - `generateRecoveryPhrase()` — draws 12 indices from `crypto.getRandomValues`. Output looks like `ocean lamp river zebra train horse stone mountain forest deep silent voice`.
+  - `normalizeRecoveryPhrase(input)` — accepts any whitespace/dash/casing variant; returns the canonical space-separated lower-case form or `null` if a word is unknown or the count is off.
+  - `phraseToBytes(phrase)` — emits the 12-byte index vector that's fed to PBKDF2; deterministic across normalization differences.
+  - **Wordlist constraint** is enforced at module load (`throw new Error` if the list isn't exactly 256 entries).
+
+#### Encrypted backup (`Signalix-frontend`)
+- **`src/lib/crypto/backup.ts`** *(new)* — encrypted backup encoder + decoder.
+  - **File format**: ASCII magic `SLXBKP01` (8 bytes) + schema version byte + 16-byte salt + 12-byte IV + AES-256-GCM ciphertext (variable). 37-byte fixed overhead; magic header lets restore reject random files before prompting for the phrase.
+  - **Payload**: JSON dump of every crypto IDB store — `IdentityRecord` (JWK-exported keypairs), `SignedPreKeyRecord[]`, `PreKeyRecord[]`, `PlaintextCacheRecord[]`, `FingerprintRecord[]`. Plaintext cache is included so the sender recovers their own message history (otherwise post-restore the sender sees `[Unable to decrypt message]` for everything they previously sent).
+  - **KDF**: PBKDF2-SHA-256, 600 000 iterations, 16-byte salt per backup. Resistant to offline brute-force in the foreseeable future (≈ 2.5 × 10²¹ years at 96 bits).
+  - **`createBackup(phrase)`** → `Uint8Array` ready for download.
+  - **`restoreBackup(file, phrase)`** → wipes the five crypto stores and writes the payload; returns a `RestoreSummary` (deviceId, exportedAt, key counts) so the UI can confirm the import.
+  - **`deleteCryptoDb()`** for the danger-zone wipe-and-start-fresh flow.
+
+#### Settings → Security (`Signalix-frontend`)
+- **`/settings/security` page** *(new)* — four sections:
+  - **About** — what's in a backup + plain-language warning that losing the phrase loses the backup, no recovery path.
+  - **Create backup** — generates a fresh phrase, encrypts the state, triggers a download (`signalix-backup-<date>.sbk`). Shows the phrase in a 12-cell grid with `Copy phrase` + `I've written it down` actions.
+  - **Restore backup** — file picker (`.sbk`) + 12-word textarea. On success shows an emerald summary card with counts and a `Reload to apply` button.
+  - **Danger zone** — wipe local crypto state + reload (for suspected key compromise or migration).
+- **`/settings/profile`** gains a "Security" section linking to the new page so the feature is discoverable.
+
+#### Tests (`Signalix-frontend`)
+- **`src/lib/crypto/bip39.test.ts`** *(new)* — 7 cases: 12-word output, low collision in 100-sample, normalization across whitespace/dashes/case, length-mismatch rejection, unknown-word rejection, `phraseToBytes` range + determinism. **36/36 frontend tests passing total.**
+
+### Fixed
+- The "wipe IDB and start fresh" path now exists as a first-class user action instead of requiring browser dev tools.
+
+### Not changed
+- No API changes — backup storage is download-only, so `Signalix-api`, `Signalix-realtime`, and `Signalix-contracts` are no-ops this release.
+- No DB migration.
+- E2EE pipeline (X3DH, fan-out, per-recipient envelopes, safety numbers, media encryption) — untouched. v0.15.0 only adds the export/import surface around it.
+- IDB schema version stays at 2.
+
+### Known limitations (intentional, per scope)
+- **Wordlist is 256 curated words, not the full BIP39 2048.** Ship size trade-off; v0.16.0+ may migrate to BIP39 for cross-app compatibility.
+- **Download-only** — no server-side backup storage. The user is responsible for keeping the `.sbk` file somewhere safe.
+- **No production trust model** — same caveat as v0.12.0 verification. The phrase is the only recovery factor; there's no cloud override.
+- **Backup roundtrip not unit-tested** — vitest's node environment doesn't expose IndexedDB. The `bip39` + crypto utilities are covered; the IDB roundtrip is validated by the manual "Delete IDB → Restore → chats decrypt" scenario.
+
+### Roadmap signal
+- **v0.16.0+** — optional server-side encrypted blob storage (opt-in), BIP39 wordlist migration for cross-app phrases, automatic backup reminders.
+
 ## v0.14.0 — 2026-06-08
 
 ### Theme

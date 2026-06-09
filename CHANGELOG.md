@@ -1,5 +1,57 @@
 # Signalix Changelog
 
+## v0.14.0 — 2026-06-08
+
+### Theme
+
+**Read receipts + delivery reliability.** Bulk read-receipt fan-out
+when a chat opens, a periodic heartbeat + auto-drain outbox when the
+WS reconnects, a sync-since-timestamp catch-up for missed receipts,
+and the Message Info dialog that breaks down "Read by / Delivered to
+/ Sent to" per participant. The state machine itself
+(CREATED → SENT → DELIVERED → READ) was already in place since v0.1.0;
+v0.14.0 fixes the gaps in propagation and surfaces.
+
+### Added
+
+#### API (`Signalix-api`)
+- **`GET /messages/:messageId/recipients/status`** → `GetMessageRecipientsStatusResponse { messageId, statuses: MessageStatusDTO[] }`. Returns one row per chat participant (excluding the sender), backfilled with implicit `SENT` at the message's `created_at` for participants who never advanced past sent. Used by the Message Info dialog.
+- **`GET /chats/:chatId/messages?since=<iso>`** — the existing endpoint now accepts a `since` cursor. When provided, the response also carries `statusUpdates: MessageStatusDTO[]` containing the per-recipient receipts that fired strictly after the cursor (bounded to 200). Drives the reconnect catch-up.
+
+#### Contracts (`Signalix-contracts`)
+- **`GetMessageRecipientsStatusResponse`**.
+- **`GetMessagesRequest.since?`** + **`GetMessagesResponse.statusUpdates?`**.
+
+#### Realtime + reliability (`Signalix-frontend`)
+- **`WsClient.send()` returns `boolean`** so callers know whether the frame went out. `sendMessageSend` propagates it.
+- **Periodic heartbeat** every 30s while the socket is OPEN; cleared on close + disconnect. Keeps idle proxies from dropping us and surfaces dead connections faster.
+- **In-memory outbox.** `TempMessage` gains `queued?: boolean` + `outboxAttempts?: number`. When `dispatchSend` sees `send() === false`, it flags the temp as queued.
+- **`drainOutbox()`** — fires on `server.authenticated` (every connect AND reconnect); walks every queued temp and re-emits via `dispatchSend` (reuses the encryption / fan-out pipeline unchanged).
+- **`syncSinceLastEvent()`** — also fires on `server.authenticated`; for every chat with messages in memory, calls `getMessages({ since: max(createdAt) })`. Newly-arrived messages are dedup-inserted; status updates are replayed by picking the highest-ranked status (read > delivered > sent) per messageId.
+- **`getMessageRecipientsStatus(messageId)`** api-client wrapper.
+
+#### Message Info dialog (`Signalix-frontend`)
+- **`MessageInfoModal.tsx`** *(new)*. Opens from the message actions menu (new "Info" item, sender-only). Direct chats: stacked Sent / Delivered / Read with timestamps. Group chats: bucketed "Read by N / Delivered to N / Sent to N" sections with avatar + name + per-participant timestamp.
+
+### Fixed (regressions caught during v0.14.0 testing)
+
+- **Issue 1 — Read tick was not blue.** `StatusIcon` rendered `text-white/70` in dark mode for the read state, indistinguishable from delivered. Now uses Apple `#007aff`/`#0a84ff` on transparent backgrounds and `#34c8ff` (Apple system-blue-light) on the blue `isMine` bubble. All 8 call sites pass `light` to pick the bubble-friendly cyan.
+- **Issue 2 — Only the last unread message was marked read.** The MessageView effect found only the most recent unread row. Now iterates every unread message from another participant and fires `markRead` per message; a `markedReadRef: Set<string>` prevents re-firing on subsequent renders (the realtime layer never broadcasts MESSAGE_READ back to the originator, so our local `state` stays at 'delivered' even after we marked it).
+- **Issue 3 — Unread badge counted 2 on a brand-new chat.** Race between `loadChats()` (server says `unreadCount: 1`) and the `MESSAGE_NEW` increment. Now the increment checks `chatTracked = s.chats.some(c => c.id === p.chatId)` — if the chat isn't in the sidebar yet, skip the +1; `loadChats` will populate the authoritative count.
+- **Issue 4 — `MobileSearchOverlay` routed to `/chats/draft:<userId>` → "Loading…".** The dynamic `[chatId]` route detected the draft prefix and redirected, but flashed Loading first. Now mirrors `ChatSidebar.startNewChat`: existing direct chat → `/chats/<realId>`; otherwise `openDraftChat(user)` + `router.push('/chats')` (where `ChatsIndexPage` renders the in-memory draft via `currentDraft`).
+
+### Not changed
+- State machine, WS event names + payloads, message_status schema, E2EE pipeline, presence integration — all unchanged.
+- The realtime layer's status-broadcast logic is unchanged; the bulk-read receipts arrive as N individual `server.message.read` events the existing handler already processes.
+- No DB migration.
+
+### Known limitations
+- **Sync cursor is `max(createdAt)` of loaded messages.** If a chat has no messages locally (never opened), `syncSinceLastEvent` skips it; missed messages for that chat surface when the user opens it (existing pagination + the new `since` query). Acceptable for the common "I was on chat X when I disconnected" case.
+- **Outbox is in-memory only.** Page reload before WS ACK loses the queued temp. Persistent outbox to IDB is on the v0.15.0+ shortlist.
+
+### Roadmap signal
+- **v0.15.0+** — persistent outbox (IDB), bulk read-receipt protocol (one event, list of message ids) to cut the WS chatter when opening a chat with many unread.
+
 ## v0.13.0 — 2026-06-08
 
 ### Theme

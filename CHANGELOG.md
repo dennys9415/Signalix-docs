@@ -1,5 +1,54 @@
 # Signalix Changelog
 
+## v0.16.0 — 2026-06-09
+
+### Theme
+
+**Mobile foundation MVP.** Signalix gets a native mobile client. A new repository, `Signalix-mobile`, ships a React Native + Expo SDK 54 app for Android (iOS works the same but is not the supported dev surface). It mirrors the web's auth + chat list + direct/group conversation + settings flows on top of the existing REST + WebSocket surface — zero server-side changes. v0.16.0 is **plaintext only** on mobile; the E2EE port (via `@stablelib/*`) is the v0.17.0 theme.
+
+### Added
+
+#### New repository — `Signalix-mobile`
+- **Stack** — Expo SDK 54, React Native 0.81, React 19.1, TypeScript strict, React Navigation 6 (native-stack + bottom-tabs), Zustand v5, `@signalix/contracts` via the `file:` protocol.
+- **Auth flow** — login / register / refresh-on-401 / logout, session blob persisted in `expo-secure-store`.
+- **Chat list** — `FlatList` of chats with avatar initials, presence dot, unread badge, pull-to-refresh, last-message preview, time-formatted timestamps.
+- **Conversation** — history pagination, send, receive, auto-deliver, auto-read (mirrors web's v0.14.0 read-receipt lifecycle with a `markedReadRef` Set guard).
+- **Settings** — username / email / display name / app version / sign out.
+- **Navigation** — Bottom tabs (Chats / Settings) inside an AppStack that also pushes the Conversation screen. AuthStack covers Login + Register.
+- **Services** —
+  - `services/api-client.ts` — REST wrapper with 401-refresh-retry, shared `refreshInFlight` promise, typed from `@signalix/contracts`.
+  - `services/ws-client.ts` — WebSocket client with 30s heartbeat + 3s reconnect, matches the web's v0.14.0 reconnect-sync semantics.
+  - `services/secure-store.ts` — `expo-secure-store` for the session, `AsyncStorage` for non-sensitive cache.
+- **Stores** —
+  - `store/auth.store.ts` — session / hydrated / loading / error + hydrate / login / register / logout.
+  - `store/chat.store.ts` — chats / messages / unreadCounts / presence / activeChatId; reacts to MESSAGE_SENT, MESSAGE_NEW, MESSAGE_DELIVERED, MESSAGE_READ, CHAT_CREATED, USER_ONLINE, USER_OFFLINE.
+- **Metro configuration** (`metro.config.js`) — watches the sibling `Signalix-contracts` directory, exposes it via `extraNodeModules`, and pins both project + contracts `node_modules` paths so the shared package resolves cleanly across Metro 0.83's stricter resolver.
+
+#### Documentation (`docs/`)
+- **`MOBILE_ARCHITECTURE.md`** *(new)* — stack, layout, auth flow, WS flow, crypto flow (plaintext-only with degradation table), storage, realtime guarantees.
+- **`MOBILE_SETUP.md`** *(new)* — Node 22 + Android Studio prereqs, build-contracts-first instruction, install/start commands, Android emulator → host networking (`10.0.2.2`), troubleshooting.
+- **`MOBILE_ROADMAP.md`** *(new)* — v0.16.0 status checklist + v0.17.0 (E2EE port via `@stablelib`), v0.18.0 (push), v0.19.0 (media), v0.20.0 (calls).
+
+### Fixed
+
+#### `Signalix-contracts`
+- **`.npmignore`** — anchored `src`, `rules`, `protocol`, `schema`, `tools`, `versions` with a leading `/` so they only match the top-level repo folders. The previous patterns matched the same-named subdirectories under `dist/` too — most importantly `dist/protocol/`, which broke any consumer that resolves the package via `npm install` (Metro for `Signalix-mobile` surfaced this as `Unable to resolve module ./protocol` at bundle time). No TypeScript surface change; packaging-only fix.
+
+### Not changed
+
+- `Signalix-api`, `Signalix-realtime`, `Signalix-frontend`, `Signalix-infra` are byte-identical to v0.15.0 apart from the lockstep version bump. The mobile app uses every existing endpoint and WS event without modification.
+- Web↔web E2EE remains intact. Mobile↔* degrades to plaintext until v0.17.0 — documented in `docs/MOBILE_ARCHITECTURE.md`.
+
+### Out of scope for v0.16.0
+
+- E2EE on mobile (lands v0.17.0).
+- Push notifications (v0.18.0).
+- Media / files / voice notes on mobile (v0.19.0).
+- Voice / video calls (v0.20.0).
+- iOS production builds, TestFlight pipeline, signed APKs, group management UI.
+
+---
+
 ## v0.15.0 — 2026-06-09
 
 ### Theme
